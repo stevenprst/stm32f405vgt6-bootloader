@@ -181,6 +181,48 @@ uint8_t readResetFlags()
 	return flags;
 }
 
+// Set the brown-out reset to level 3 (reset below about 2.7 V, the lowest voltage word programming is allowed at),
+// and write protect sector 0 when BOOTLOADER_PROTECT_SECTOR0 is set. Writes the option bytes only when they differ,
+// so it happens once per chip. Writing them resets the MCU.
+void configureOptionBytes()
+{
+	static constexpr bool protect_sector0 = BOOTLOADER_PROTECT_SECTOR0 != 0;
+
+	FLASH_OBProgramInitTypeDef current{};
+	HAL_FLASHEx_OBGetConfig(&current);
+
+	const bool brown_out_level_set = current.BORLevel == OB_BOR_LEVEL3;
+
+	// In the option bytes a cleared bit means the sector is write protected.
+	const bool sector0_protected = (current.WRPSector & OB_WRP_SECTOR_0) == 0;
+	const bool protection_ok = !protect_sector0 || sector0_protected;
+
+	if (brown_out_level_set && protection_ok) {
+		return;
+	}
+
+	FLASH_OBProgramInitTypeDef request{};
+	request.OptionType = OPTIONBYTE_BOR;
+	request.BORLevel = OB_BOR_LEVEL3;
+
+	if (protect_sector0) {
+		request.OptionType |= OPTIONBYTE_WRP;
+		request.WRPState = OB_WRPSTATE_ENABLE;
+		request.WRPSector = OB_WRP_SECTOR_0;
+		request.Banks = FLASH_BANK_1;
+	}
+
+	HAL_FLASH_Unlock();
+	HAL_FLASH_OB_Unlock();
+	HAL_FLASHEx_OBProgram(&request);
+
+	// Loads the new option bytes and resets the MCU, so nothing after this line runs.
+	HAL_FLASH_OB_Launch();
+
+	HAL_FLASH_OB_Lock();
+	HAL_FLASH_Lock();
+}
+
 void sendResponse(Command command, uint16_t index, ResponseCode response_code, const uint8_t payload[3] = nullptr)
 {
 	ResponseFrame response{};
@@ -261,6 +303,12 @@ void Bootloader::init()
 	// Read the reset cause before anything can reset the MCU again, then clear it for the next reset.
 	_reset_flags = readResetFlags();
 	__HAL_RCC_CLEAR_RESET_FLAGS();
+
+	if (BOOTLOADER_FREEZE_IWDG_IN_DEBUG != 0) {
+		__HAL_DBGMCU_FREEZE_IWDG();
+	}
+
+	configureOptionBytes();
 
 	// An app that wants to be flashed leaves the stay token before it resets. A watchdog reset also holds the
 	// bootloader, because something went wrong that the host may want to look at.

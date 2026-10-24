@@ -20,8 +20,19 @@ extern IWDG_HandleTypeDef hiwdg;
 
 // Build options, set with -D in Properties, C/C++ Build, Settings, MCU G++ Compiler, Preprocessor.
 //   BOOTLOADER_NODE_ID=n                 which board this image answers for, 1 when not set
+//   BOOTLOADER_PROTECT_SECTOR0=1         write protect the bootloader sector in the option bytes (production only,
+//                                        the debugger can no longer rewrite the bootloader afterwards)
+//   BOOTLOADER_FREEZE_IWDG_IN_DEBUG=1    stop the watchdog while the debugger halts the core (bench only)
 #ifndef BOOTLOADER_NODE_ID
 #define BOOTLOADER_NODE_ID 1
+#endif
+
+#ifndef BOOTLOADER_PROTECT_SECTOR0
+#define BOOTLOADER_PROTECT_SECTOR0 0
+#endif
+
+#ifndef BOOTLOADER_FREEZE_IWDG_IN_DEBUG
+#define BOOTLOADER_FREEZE_IWDG_IN_DEBUG 0
 #endif
 
 namespace can_bootloader
@@ -226,7 +237,7 @@ public:
 	// Jump to the app when the SRAM token is set. Does nothing otherwise.
 	void jumpToAppIfRequested();
 
-	// Set up the CAN filter, start CAN and enable the receive interrupt.
+	// Set the option bytes, set up the CAN filter, start CAN and enable the receive interrupt.
 	void init();
 
 	// One pass of the main loop: kick the watchdog, handle one command, or start the app after silence.
