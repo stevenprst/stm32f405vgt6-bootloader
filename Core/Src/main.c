@@ -73,7 +73,7 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
+  mainLoopJumpToAppIfRequested();
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -85,7 +85,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   /* USER CODE BEGIN 2 */
-
+  mainLoopInit();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -95,6 +95,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    mainLoopRun();
   }
   /* USER CODE END 3 */
 }

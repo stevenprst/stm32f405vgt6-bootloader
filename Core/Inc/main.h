@@ -53,6 +53,9 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
+void mainLoopJumpToAppIfRequested(void);
+void mainLoopInit(void);
+void mainLoopRun(void);
 
 /* USER CODE END EFP */
 
