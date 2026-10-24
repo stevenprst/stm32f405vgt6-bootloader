@@ -1,0 +1,14 @@
+# CubeIDE build output
+Debug/
+Release/
+
+# Backups and Python caches
+*.bak
+__pycache__/
+*.pyc
+
+# Not part of this repository: the F407 reference project (it has its own repository), the notes and the reference
+# copy of the code in docs, and the other related projects
+f407vgt6-can-bus-bootloader/
+docs/
+other_related_projects/
