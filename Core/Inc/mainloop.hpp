@@ -51,6 +51,12 @@ static constexpr uint32_t metadata_address = app_address - page_size_bytes;
 // The most pages the app area holds, 992 pages of 1 KB.
 static constexpr uint32_t max_page_count = (app_end_address - app_address) / page_size_bytes;
 
+// RAM an app can put its stack in. An app whose first word is outside both is not started.
+static constexpr uint32_t ram_begin_address = 0x20000000;
+static constexpr uint32_t ram_end_address = 0x20020000;
+static constexpr uint32_t ccm_ram_begin_address = 0x10000000;
+static constexpr uint32_t ccm_ram_end_address = 0x10010000;
+
 // How long to wait for a reply frame to leave the CAN mailbox.
 static constexpr uint32_t reply_timeout_ms = 100;
 
@@ -61,17 +67,20 @@ static_assert((ring_size & (ring_size - 1)) == 0, "the ring index is taken with 
 enum class Command : uint8_t {
 	WriteBuffer = 1,	// store one word of the page buffer
 	WritePage = 2,		// program the page buffer into flash
+	WriteCrc = 3,		// check the whole image and store its metadata
 	Ping = 4,		// answer, nothing else
 };
 
 enum class ResponseCode : uint8_t {
 	Ok = 0,
 	BadIndex = 1,		// word, page, page count or info item out of range
+	CrcMismatch = 2,	// the image in flash does not match the host CRC
 	ProgramFailed = 3,	// flash programming or its read back failed
 	EraseFailed = 4,	// a sector did not erase
 	PageIncomplete = 5,	// WritePage came before all 256 words of the page
 	PageCrcMismatch = 6,	// the page buffer does not match the CRC the host sent with WritePage
 	BadSequence = 7,	// a page other than the next one, the last one again, or page 0
+	BadImage = 8,		// no stored app, or its vector table is not a valid one for this address
 	UnknownCommand = 9,
 };
 
@@ -95,6 +104,16 @@ struct __attribute__((packed)) ResponseFrame {
 };
 
 static_assert(sizeof(ResponseFrame) == 8, "a reply is exactly one 8-byte CAN frame");
+
+// Written once before the app, 0xFFFFFFFF in both words while no valid app is stored.
+struct AppMetadata {
+	uint32_t page_count;
+	uint32_t app_crc;
+};
+
+static_assert(sizeof(AppMetadata) == 8, "the metadata is two flash words");
+static_assert(max_page_count == 992, "the app area is 992 KB");
+static_assert(metadata_address >= metadata_sector_address, "the metadata is inside its sector");
 
 // The 12 flash sectors of the STM32F405VG, in address order.
 namespace flash_layout
@@ -188,6 +207,7 @@ private:
 	void _handlePing(const CommandFrame &frame);
 	void _handleWriteBuffer(const CommandFrame &frame);
 	void _handleWritePage(const CommandFrame &frame);
+	void _handleWriteCrc(const CommandFrame &frame);
 
 	// Frames from the interrupt to the main loop. The interrupt only writes _ring_head, the main loop only _ring_tail.
 	// Both count up forever and are taken modulo ring_size to find the slot.

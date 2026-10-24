@@ -25,6 +25,11 @@ bool isBlank(uint32_t address, uint32_t word_count)
 	return true;
 }
 
+bool isInRange(uint32_t value, uint32_t first, uint32_t last)
+{
+	return value >= first && value <= last;
+}
+
 void clearFlashErrorFlags()
 {
 	__HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR
@@ -111,6 +116,25 @@ uint32_t calculateWordsCrc(const uint32_t *words, uint32_t word_count)
 	__HAL_CRC_DR_RESET(&hcrc);
 
 	return HAL_CRC_Calculate(&hcrc, const_cast<uint32_t *>(words), word_count);
+}
+
+// The app's first word is its stack pointer and the second its reset handler. A file linked for another address,
+// for example 0x08000000, fails here even when its CRC is right.
+bool appVectorTableIsValid()
+{
+	const uint32_t *vector_table = reinterpret_cast<const uint32_t *>(app_address);
+	const uint32_t stack_pointer = vector_table[0];
+	const uint32_t reset_vector = vector_table[1];
+
+	const bool stack_in_ram = isInRange(stack_pointer, ram_begin_address, ram_end_address);
+	const bool stack_in_ccm_ram = isInRange(stack_pointer, ccm_ram_begin_address, ccm_ram_end_address);
+
+	// A Cortex-M reset vector has bit 0 set for Thumb code.
+	const bool reset_is_thumb = (reset_vector & 1u) != 0;
+	const uint32_t reset_address = reset_vector & ~1u;
+	const bool reset_in_app = reset_address >= app_address && reset_address < app_end_address;
+
+	return (stack_in_ram || stack_in_ccm_ram) && reset_is_thumb && reset_in_app;
 }
 
 void sendResponse(Command command, uint16_t index, ResponseCode response_code, const uint8_t payload[3] = nullptr)
@@ -251,6 +275,10 @@ void Bootloader::_handleCommand(const CommandFrame &frame)
 		_handleWritePage(frame);
 		break;
 
+	case Command::WriteCrc:
+		_handleWriteCrc(frame);
+		break;
+
 	default:
 		sendResponse(static_cast<Command>(frame.command), frame.index, ResponseCode::UnknownCommand);
 		break;
@@ -354,6 +382,45 @@ void Bootloader::_handleWritePage(const CommandFrame &frame)
 	_next_page_index = page_index + 1;
 	_page_committed = true;
 	sendResponse(Command::WritePage, frame.index, ResponseCode::Ok);
+}
+
+void Bootloader::_handleWriteCrc(const CommandFrame &frame)
+{
+	const uint32_t page_count = frame.index;
+	const uint32_t host_crc = frame.value;
+
+	const bool page_count_in_range = page_count != 0 && page_count <= max_page_count;
+
+	if (!page_count_in_range) {
+		sendResponse(Command::WriteCrc, frame.index, ResponseCode::BadIndex);
+		return;
+	}
+
+	const uint32_t flash_crc = calculateWordsCrc(reinterpret_cast<const uint32_t *>(app_address),
+						      page_count * page_size_words);
+	const bool crc_matches = flash_crc == host_crc;
+
+	if (!crc_matches) {
+		sendResponse(Command::WriteCrc, frame.index, ResponseCode::CrcMismatch);
+		return;
+	}
+
+	// No metadata is stored for an image that cannot run, so the bootloader never starts it.
+	if (!appVectorTableIsValid()) {
+		sendResponse(Command::WriteCrc, frame.index, ResponseCode::BadImage);
+		return;
+	}
+
+	const AppMetadata metadata = {page_count, host_crc};
+	const bool metadata_programmed = programWords(metadata_address, reinterpret_cast<const uint32_t *>(&metadata),
+					       sizeof(metadata) / sizeof(uint32_t));
+
+	if (!metadata_programmed) {
+		sendResponse(Command::WriteCrc, frame.index, ResponseCode::ProgramFailed);
+		return;
+	}
+
+	sendResponse(Command::WriteCrc, frame.index, ResponseCode::Ok);
 }
 
 } // namespace can_bootloader
