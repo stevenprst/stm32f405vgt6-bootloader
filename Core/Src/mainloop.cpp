@@ -11,6 +11,108 @@ namespace
 // The one bootloader of this image.
 Bootloader bootloader;
 
+// True when every word in the range reads as erased flash.
+bool isBlank(uint32_t address, uint32_t word_count)
+{
+	const volatile uint32_t *flash_words = reinterpret_cast<const volatile uint32_t *>(address);
+
+	for (uint32_t word_number = 0; word_number < word_count; ++word_number) {
+		if (flash_words[word_number] != 0xFFFFFFFFu) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+void clearFlashErrorFlags()
+{
+	__HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR
+			       | FLASH_FLAG_PGAERR | FLASH_FLAG_PGPERR | FLASH_FLAG_PGSERR);
+}
+
+// The data cache can hold flash lines read before a program or erase, so reset it before reading the result back.
+void flushFlashCaches()
+{
+	__HAL_FLASH_DATA_CACHE_DISABLE();
+	__HAL_FLASH_DATA_CACHE_RESET();
+	__HAL_FLASH_DATA_CACHE_ENABLE();
+}
+
+// Erase the sector that starts at the address. False when the address is not a sector start or the sector is not blank.
+bool eraseSectorStartingAt(uint32_t address)
+{
+	const flash_layout::FlashSector *sector = flash_layout::sectorStartingAt(address);
+
+	if (sector == nullptr) {
+		return false;
+	}
+
+	FLASH_EraseInitTypeDef erase_config{};
+	erase_config.TypeErase = FLASH_TYPEERASE_SECTORS;
+	erase_config.Sector = sector->number;
+	erase_config.NbSectors = 1;
+	erase_config.VoltageRange = FLASH_VOLTAGE_RANGE_3;
+
+	uint32_t failed_sector_number = 0;
+
+	// The erase stalls the CPU for up to 4 s, so the watchdog is kicked just before and just after it.
+	HAL_IWDG_Refresh(&hiwdg);
+	HAL_FLASH_Unlock();
+	clearFlashErrorFlags();
+	const HAL_StatusTypeDef erase_status = HAL_FLASHEx_Erase(&erase_config, &failed_sector_number);
+	HAL_FLASH_Lock();
+	HAL_IWDG_Refresh(&hiwdg);
+
+	if (erase_status != HAL_OK) {
+		return false;
+	}
+
+	flushFlashCaches();
+
+	return isBlank(sector->start_address, sector->size_bytes / 4);
+}
+
+// Program words into erased flash and read them back. A page already holding the same words counts as programmed.
+bool programWords(uint32_t address, const uint32_t *words, uint32_t word_count)
+{
+	const uint32_t *flash_words = reinterpret_cast<const uint32_t *>(address);
+	const bool already_programmed = memcmp(flash_words, words, word_count * sizeof(uint32_t)) == 0;
+
+	if (already_programmed) {
+		return true;
+	}
+
+	HAL_FLASH_Unlock();
+	clearFlashErrorFlags();
+
+	for (uint32_t word_number = 0; word_number < word_count; ++word_number) {
+		const uint32_t word_address = address + word_number * sizeof(uint32_t);
+		const HAL_StatusTypeDef program_status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, word_address,
+							 words[word_number]);
+		const bool word_programmed = program_status == HAL_OK;
+
+		if (!word_programmed) {
+			HAL_FLASH_Lock();
+			return false;
+		}
+	}
+
+	HAL_FLASH_Lock();
+	HAL_IWDG_Refresh(&hiwdg);
+	flushFlashCaches();
+
+	return memcmp(flash_words, words, word_count * sizeof(uint32_t)) == 0;
+}
+
+// The hardware CRC of the words, fed one 32-bit word at a time.
+uint32_t calculateWordsCrc(const uint32_t *words, uint32_t word_count)
+{
+	__HAL_CRC_DR_RESET(&hcrc);
+
+	return HAL_CRC_Calculate(&hcrc, const_cast<uint32_t *>(words), word_count);
+}
+
 void sendResponse(Command command, uint16_t index, ResponseCode response_code, const uint8_t payload[3] = nullptr)
 {
 	ResponseFrame response{};
@@ -141,6 +243,14 @@ void Bootloader::_handleCommand(const CommandFrame &frame)
 		_handlePing(frame);
 		break;
 
+	case Command::WriteBuffer:
+		_handleWriteBuffer(frame);
+		break;
+
+	case Command::WritePage:
+		_handleWritePage(frame);
+		break;
+
 	default:
 		sendResponse(static_cast<Command>(frame.command), frame.index, ResponseCode::UnknownCommand);
 		break;
@@ -150,6 +260,100 @@ void Bootloader::_handleCommand(const CommandFrame &frame)
 void Bootloader::_handlePing(const CommandFrame &frame)
 {
 	sendResponse(Command::Ping, frame.index, ResponseCode::Ok);
+}
+
+void Bootloader::_handleWriteBuffer(const CommandFrame &frame)
+{
+	const uint32_t word_index = frame.index;
+	const bool word_in_range = word_index < page_size_words;
+
+	if (!word_in_range) {
+		sendResponse(Command::WriteBuffer, frame.index, ResponseCode::BadIndex);
+		return;
+	}
+
+	// The first word of a new page starts a new page buffer.
+	if (_page_committed) {
+		memset(_word_present, 0, sizeof(_word_present));
+		_present_word_count = 0;
+		_page_committed = false;
+	}
+
+	// A word sent twice, for example after a lost reply, is counted once.
+	if (!_word_present[word_index]) {
+		_word_present[word_index] = true;
+		_present_word_count++;
+	}
+
+	_page_buffer_words[word_index] = frame.value;
+	sendResponse(Command::WriteBuffer, frame.index, ResponseCode::Ok);
+}
+
+void Bootloader::_handleWritePage(const CommandFrame &frame)
+{
+	const uint32_t page_index = frame.index;
+	const uint32_t host_page_crc = frame.value;
+	const bool page_in_range = page_index < max_page_count;
+
+	if (!page_in_range) {
+		sendResponse(Command::WritePage, frame.index, ResponseCode::BadIndex);
+		return;
+	}
+
+	// Pages go in order: the next one, the last one again after a lost reply, or page 0 to start over.
+	const bool is_restart = page_index == 0;
+	const bool is_next_page = page_index == _next_page_index;
+	const bool is_last_page_again = _next_page_index != 0 && page_index == _next_page_index - 1;
+	const bool page_in_sequence = is_restart || is_next_page || is_last_page_again;
+
+	if (!page_in_sequence) {
+		sendResponse(Command::WritePage, frame.index, ResponseCode::BadSequence);
+		return;
+	}
+
+	const bool page_complete = _present_word_count == page_size_words;
+
+	if (!page_complete) {
+		sendResponse(Command::WritePage, frame.index, ResponseCode::PageIncomplete);
+		return;
+	}
+
+	const uint32_t buffer_crc = calculateWordsCrc(_page_buffer_words, page_size_words);
+	const bool page_crc_matches = buffer_crc == host_page_crc;
+
+	if (!page_crc_matches) {
+		sendResponse(Command::WritePage, frame.index, ResponseCode::PageCrcMismatch);
+		return;
+	}
+
+	const uint32_t page_address = app_address + page_index * page_size_bytes;
+
+	// Page 0 erases the metadata sector first, so an upload that stops halfway leaves no valid metadata.
+	const bool first_page = page_index == 0;
+
+	if (first_page && !eraseSectorStartingAt(metadata_sector_address)) {
+		sendResponse(Command::WritePage, frame.index, ResponseCode::EraseFailed);
+		return;
+	}
+
+	// Pages arrive in ascending order, so a sector is erased when the page that opens it arrives.
+	const bool starts_sector = flash_layout::isSectorStart(page_address);
+
+	if (starts_sector && !eraseSectorStartingAt(page_address)) {
+		sendResponse(Command::WritePage, frame.index, ResponseCode::EraseFailed);
+		return;
+	}
+
+	const bool page_programmed = programWords(page_address, _page_buffer_words, page_size_words);
+
+	if (!page_programmed) {
+		sendResponse(Command::WritePage, frame.index, ResponseCode::ProgramFailed);
+		return;
+	}
+
+	_next_page_index = page_index + 1;
+	_page_committed = true;
+	sendResponse(Command::WritePage, frame.index, ResponseCode::Ok);
 }
 
 } // namespace can_bootloader
