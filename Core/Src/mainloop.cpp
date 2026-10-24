@@ -262,6 +262,19 @@ void Bootloader::init()
 	_reset_flags = readResetFlags();
 	__HAL_RCC_CLEAR_RESET_FLAGS();
 
+	// An app that wants to be flashed leaves the stay token before it resets. A watchdog reset also holds the
+	// bootloader, because something went wrong that the host may want to look at.
+	volatile uint32_t *stay = reinterpret_cast<volatile uint32_t *>(stay_token_address);
+	const bool stay_requested = *stay == stay_token;
+	*stay = 0;
+
+	const bool watchdog_reset = (_reset_flags & reset_flag_watchdog) != 0;
+	const bool hold_for_host = stay_requested || watchdog_reset;
+
+	if (hold_for_host) {
+		_startup_window_ms = stay_window_ms;
+	}
+
 	// Pass only command frames: standard ID command_can_id, data frame. The mask bits are the ID, IDE and RTR bits.
 	CAN_FilterTypeDef filter{};
 	filter.FilterIdHigh = command_can_id << 5;

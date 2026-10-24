@@ -60,13 +60,17 @@ static constexpr uint32_t ram_end_address = 0x20020000;
 static constexpr uint32_t ccm_ram_begin_address = 0x10000000;
 static constexpr uint32_t ccm_ram_end_address = 0x10010000;
 
-// A word in SRAM that survives a software reset. The linker script checks that the bootloader's own
-// RAM stays below it.
+// Two words in SRAM that survive a software reset. The linker script checks that the bootloader's own RAM stays below.
+//   jump token: the bootloader checked the app and reset to start it
+//   stay token: the app asks the bootloader to wait for the host, written by the app just before it resets
 static constexpr uint32_t jump_token = 0x53544D33;
 static constexpr uint32_t jump_token_address = SRAM_BASE + 0x3000;
+static constexpr uint32_t stay_token = 0x53544159;
+static constexpr uint32_t stay_token_address = SRAM_BASE + 0x3004;
 
 // How long the bootloader waits for the host before it tries to start the app.
 static constexpr uint32_t startup_window_ms = 250;
+static constexpr uint32_t stay_window_ms = 30000;	// after a stay token or a watchdog reset
 static constexpr uint32_t host_silence_timeout_ms = 2500;
 
 // How long to wait for a reply frame to leave the CAN mailbox.
