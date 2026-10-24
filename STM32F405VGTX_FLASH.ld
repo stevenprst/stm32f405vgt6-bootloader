@@ -47,7 +47,7 @@ MEMORY
 {
   CCMRAM    (xrw)    : ORIGIN = 0x10000000,   LENGTH = 64K
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 128K
-  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 1024K
+  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 16K
 }
 
 /* Sections */
@@ -206,3 +206,6 @@ SECTIONS
 
   .ARM.attributes 0 : { *(.ARM.attributes) }
 }
+
+/* The jump token and the stay token live at 0x20003000 and 0x20003004. The bootloader RAM must stay below them. */
+ASSERT(_ebss + _Min_Heap_Size <= 0x20003000, "bootloader RAM overlaps the jump and stay tokens")
