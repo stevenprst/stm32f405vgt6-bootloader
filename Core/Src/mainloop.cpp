@@ -118,6 +118,14 @@ uint32_t calculateWordsCrc(const uint32_t *words, uint32_t word_count)
 	return HAL_CRC_Calculate(&hcrc, const_cast<uint32_t *>(words), word_count);
 }
 
+AppMetadata readMetadata()
+{
+	AppMetadata metadata;
+	memcpy(&metadata, reinterpret_cast<const void *>(metadata_address), sizeof(metadata));
+
+	return metadata;
+}
+
 // The app's first word is its stack pointer and the second its reset handler. A file linked for another address,
 // for example 0x08000000, fails here even when its CRC is right.
 bool appVectorTableIsValid()
@@ -177,8 +185,43 @@ void sendResponse(Command command, uint16_t index, ResponseCode response_code, c
 
 } // namespace
 
+void Bootloader::jumpToAppIfRequested()
+{
+	volatile uint32_t *token = reinterpret_cast<volatile uint32_t *>(jump_token_address);
+
+	const bool jump_requested = *token == jump_token;
+
+	if (!jump_requested) {
+		return;
+	}
+
+	// Clear the token first, so a reset inside the app comes back to the bootloader.
+	*token = 0;
+
+	// The CRC was checked before the token was set, so this only guards against a token left by something else.
+	if (!appVectorTableIsValid()) {
+		return;
+	}
+
+	const uint32_t *app_vector_table = reinterpret_cast<const uint32_t *>(app_address);
+	const uint32_t app_stack_pointer = app_vector_table[0];
+	const uint32_t app_reset_vector = app_vector_table[1];
+
+	// Hand the app a quiet core: no SysTick interrupt from the bootloader and the app's own vector table.
+	SysTick->CTRL = 0;
+	SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk;
+	SCB->VTOR = app_address;
+	__DSB();
+	__ISB();
+
+	__set_MSP(app_stack_pointer);
+	reinterpret_cast<void (*)()>(app_reset_vector)();
+}
+
 void Bootloader::init()
 {
+	_startup_window_ms = startup_window_ms;
+
 	// Pass only command frames: standard ID command_can_id, data frame. The mask bits are the ID, IDE and RTR bits.
 	CAN_FilterTypeDef filter{};
 	filter.FilterIdHigh = command_can_id << 5;
@@ -198,7 +241,7 @@ void Bootloader::init()
 	const bool started = filter_set && HAL_CAN_Start(&hcan1) == HAL_OK;
 	const bool notified = started && HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) == HAL_OK;
 
-	// Without CAN the host cannot be reached.
+	// Without CAN the host cannot be reached, so run() goes straight to starting the app.
 	_can_ready = notified;
 }
 
@@ -245,7 +288,7 @@ void Bootloader::run()
 	HAL_IWDG_Refresh(&hiwdg);
 
 	if (!_can_ready) {
-		return;
+		_startAppIfIntact();
 	}
 
 	const uint32_t tail = _ring_tail.load(std::memory_order_relaxed);
@@ -255,9 +298,23 @@ void Bootloader::run()
 	if (frame_waiting) {
 		const CommandFrame frame = _ring[tail % ring_size];
 		_handleCommand(frame);
+
+		// Timed after the command, because an erase can take seconds.
+		_last_host_frame_ms = HAL_GetTick();
+		_host_seen = true;
 		_ring_tail.store(tail + 1, std::memory_order_release);
 		return;
 	}
+
+	const uint32_t silence_limit_ms = _host_seen ? host_silence_timeout_ms : _startup_window_ms;
+	const uint32_t silent_ms = HAL_GetTick() - _last_host_frame_ms;
+	const bool host_still_active = silent_ms <= silence_limit_ms;
+
+	if (host_still_active) {
+		return;
+	}
+
+	_startAppIfIntact();
 }
 
 void Bootloader::_handleCommand(const CommandFrame &frame)
@@ -423,12 +480,59 @@ void Bootloader::_handleWriteCrc(const CommandFrame &frame)
 	sendResponse(Command::WriteCrc, frame.index, ResponseCode::Ok);
 }
 
+ResponseCode Bootloader::_checkStoredApp() const
+{
+	const AppMetadata metadata = readMetadata();
+
+	// Blank flash reads 0xFFFFFFFF, which is above max_page_count, so a blank metadata sector is rejected here.
+	const bool metadata_valid = metadata.page_count != 0 && metadata.page_count <= max_page_count;
+
+	if (!metadata_valid) {
+		return ResponseCode::BadImage;
+	}
+
+	const uint32_t flash_crc = calculateWordsCrc(reinterpret_cast<const uint32_t *>(app_address),
+						      metadata.page_count * page_size_words);
+	const bool crc_matches = flash_crc == metadata.app_crc;
+
+	if (!crc_matches) {
+		return ResponseCode::CrcMismatch;
+	}
+
+	if (!appVectorTableIsValid()) {
+		return ResponseCode::BadImage;
+	}
+
+	return ResponseCode::Ok;
+}
+
+void Bootloader::_resetIntoApp()
+{
+	*reinterpret_cast<volatile uint32_t *>(jump_token_address) = jump_token;
+
+	// With the token set the reset ends in the app.
+	NVIC_SystemReset();
+}
+
+void Bootloader::_startAppIfIntact()
+{
+	const bool app_intact = _checkStoredApp() == ResponseCode::Ok;
+
+	if (app_intact) {
+		_resetIntoApp();
+	}
+
+	// Without a good app the reset ends in the bootloader again, which waits for the host once more.
+	NVIC_SystemReset();
+}
+
 } // namespace can_bootloader
 
 // The three hooks are declared extern "C" in main.h and the HAL callback in the HAL CAN header, so these
 // definitions keep C linkage.
 void mainLoopJumpToAppIfRequested(void)
 {
+	can_bootloader::bootloader.jumpToAppIfRequested();
 }
 
 void mainLoopInit(void)

@@ -57,6 +57,15 @@ static constexpr uint32_t ram_end_address = 0x20020000;
 static constexpr uint32_t ccm_ram_begin_address = 0x10000000;
 static constexpr uint32_t ccm_ram_end_address = 0x10010000;
 
+// A word in SRAM that survives a software reset. The linker script checks that the bootloader's own
+// RAM stays below it.
+static constexpr uint32_t jump_token = 0x53544D33;
+static constexpr uint32_t jump_token_address = SRAM_BASE + 0x3000;
+
+// How long the bootloader waits for the host before it tries to start the app.
+static constexpr uint32_t startup_window_ms = 250;
+static constexpr uint32_t host_silence_timeout_ms = 2500;
+
 // How long to wait for a reply frame to leave the CAN mailbox.
 static constexpr uint32_t reply_timeout_ms = 100;
 
@@ -193,10 +202,13 @@ static_assert(sectorNumberStartingAt(app_end_address - 128 * 1024) == FLASH_SECT
 class Bootloader
 {
 public:
+	// Jump to the app when the SRAM token is set. Does nothing otherwise.
+	void jumpToAppIfRequested();
+
 	// Set up the CAN filter, start CAN and enable the receive interrupt.
 	void init();
 
-	// One pass of the main loop: kick the watchdog and handle one command.
+	// One pass of the main loop: kick the watchdog, handle one command, or start the app after silence.
 	void run();
 
 	// Called from the CAN receive interrupt for each frame in FIFO0.
@@ -208,6 +220,15 @@ private:
 	void _handleWriteBuffer(const CommandFrame &frame);
 	void _handleWritePage(const CommandFrame &frame);
 	void _handleWriteCrc(const CommandFrame &frame);
+
+	// Look at the stored app: metadata, CRC and vector table. Ok means it can be started.
+	ResponseCode _checkStoredApp() const;
+
+	// Set the jump token and reset. Never returns.
+	void _resetIntoApp();
+
+	// Start the app when it is intact, otherwise reset into the bootloader again. Never returns.
+	void _startAppIfIntact();
 
 	// Frames from the interrupt to the main loop. The interrupt only writes _ring_head, the main loop only _ring_tail.
 	// Both count up forever and are taken modulo ring_size to find the slot.
@@ -226,7 +247,13 @@ private:
 	// The page the host has to send next, 0 before the first page.
 	uint32_t _next_page_index{0};
 
-	// Set in init(): whether CAN started.
+	// False until the first frame for this node is handled; the timestamp is of the end of that command.
+	bool _host_seen{false};
+	uint32_t _last_host_frame_ms{0};
+
+	// Set in init(): how long to wait for the host, and whether CAN started.
+	// They start at zero so the whole object is in .bss and takes no flash for initial values.
+	uint32_t _startup_window_ms{0};
 	bool _can_ready{false};
 };
 
