@@ -145,6 +145,42 @@ bool appVectorTableIsValid()
 	return (stack_in_ram || stack_in_ccm_ram) && reset_is_thumb && reset_in_app;
 }
 
+// The reset flags of RCC->CSR as the reset_flag_* bits of GetInfo.
+uint8_t readResetFlags()
+{
+	const uint32_t status = RCC->CSR;
+
+	const bool power_on = (status & RCC_CSR_PORRSTF) != 0;
+	const bool software = (status & RCC_CSR_SFTRSTF) != 0;
+	const bool watchdog = (status & (RCC_CSR_IWDGRSTF | RCC_CSR_WWDGRSTF)) != 0;
+	const bool brown_out = (status & RCC_CSR_BORRSTF) != 0;
+	const bool pin = (status & RCC_CSR_PINRSTF) != 0;
+
+	uint8_t flags = 0;
+
+	if (power_on) {
+		flags |= reset_flag_power_on;
+	}
+
+	if (software) {
+		flags |= reset_flag_software;
+	}
+
+	if (watchdog) {
+		flags |= reset_flag_watchdog;
+	}
+
+	if (brown_out) {
+		flags |= reset_flag_brown_out;
+	}
+
+	if (pin) {
+		flags |= reset_flag_pin;
+	}
+
+	return flags;
+}
+
 void sendResponse(Command command, uint16_t index, ResponseCode response_code, const uint8_t payload[3] = nullptr)
 {
 	ResponseFrame response{};
@@ -221,6 +257,10 @@ void Bootloader::jumpToAppIfRequested()
 void Bootloader::init()
 {
 	_startup_window_ms = startup_window_ms;
+
+	// Read the reset cause before anything can reset the MCU again, then clear it for the next reset.
+	_reset_flags = readResetFlags();
+	__HAL_RCC_CLEAR_RESET_FLAGS();
 
 	// Pass only command frames: standard ID command_can_id, data frame. The mask bits are the ID, IDE and RTR bits.
 	CAN_FilterTypeDef filter{};
@@ -334,6 +374,14 @@ void Bootloader::_handleCommand(const CommandFrame &frame)
 
 	case Command::WriteCrc:
 		_handleWriteCrc(frame);
+		break;
+
+	case Command::GetInfo:
+		_handleGetInfo(frame);
+		break;
+
+	case Command::StartApp:
+		_handleStartApp(frame);
 		break;
 
 	default:
@@ -478,6 +526,57 @@ void Bootloader::_handleWriteCrc(const CommandFrame &frame)
 	}
 
 	sendResponse(Command::WriteCrc, frame.index, ResponseCode::Ok);
+}
+
+void Bootloader::_handleGetInfo(const CommandFrame &frame)
+{
+	uint8_t payload[3] = {0, 0, 0};
+
+	switch (frame.index) {
+	case info_item_version:
+		payload[0] = bootloader_version;
+		payload[1] = static_cast<uint8_t>(max_page_count & 0xFF);
+		payload[2] = static_cast<uint8_t>(max_page_count >> 8);
+		break;
+
+	case info_item_stored_app: {
+			// Blank metadata reads 0xFFFF here, which is above max_page_count, so the host sees "no app".
+			const AppMetadata metadata = readMetadata();
+			payload[0] = static_cast<uint8_t>(metadata.page_count & 0xFF);
+			payload[1] = static_cast<uint8_t>((metadata.page_count >> 8) & 0xFF);
+			payload[2] = _reset_flags;
+			break;
+		}
+
+	case info_item_can_error: {
+			const uint32_t can_error = HAL_CAN_GetError(&hcan1);
+			payload[0] = static_cast<uint8_t>(can_error & 0xFF);
+			payload[1] = static_cast<uint8_t>((can_error >> 8) & 0xFF);
+			payload[2] = static_cast<uint8_t>((can_error >> 16) & 0xFF);
+			break;
+		}
+
+	default:
+		sendResponse(Command::GetInfo, frame.index, ResponseCode::BadIndex);
+		return;
+	}
+
+	sendResponse(Command::GetInfo, frame.index, ResponseCode::Ok, payload);
+}
+
+void Bootloader::_handleStartApp(const CommandFrame &frame)
+{
+	const ResponseCode app_state = _checkStoredApp();
+	const bool app_intact = app_state == ResponseCode::Ok;
+
+	if (!app_intact) {
+		sendResponse(Command::StartApp, frame.index, app_state);
+		return;
+	}
+
+	// The reply has to leave before the reset.
+	sendResponse(Command::StartApp, frame.index, ResponseCode::Ok);
+	_resetIntoApp();
 }
 
 ResponseCode Bootloader::_checkStoredApp() const

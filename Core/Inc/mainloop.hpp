@@ -27,6 +27,9 @@ extern IWDG_HandleTypeDef hiwdg;
 namespace can_bootloader
 {
 
+// Bumped when the protocol or the reply layout changes. The host can read it with GetInfo.
+static constexpr uint8_t bootloader_version = 2;
+
 // CAN IDs, all standard 11-bit.
 static constexpr uint16_t command_can_id = 0x6A5;	// host to bootloader
 static constexpr uint16_t response_can_id = 0x6A6;	// bootloader to host
@@ -78,6 +81,8 @@ enum class Command : uint8_t {
 	WritePage = 2,		// program the page buffer into flash
 	WriteCrc = 3,		// check the whole image and store its metadata
 	Ping = 4,		// answer, nothing else
+	GetInfo = 5,		// read one item of information, chosen by index
+	StartApp = 6,		// check the stored app and start it now
 };
 
 enum class ResponseCode : uint8_t {
@@ -92,6 +97,18 @@ enum class ResponseCode : uint8_t {
 	BadImage = 8,		// no stored app, or its vector table is not a valid one for this address
 	UnknownCommand = 9,
 };
+
+// GetInfo items, sent in the index field.
+static constexpr uint16_t info_item_version = 0;	// payload: version (u8), max_page_count (u16)
+static constexpr uint16_t info_item_stored_app = 1;	// payload: stored page count (u16), reset flags (u8)
+static constexpr uint16_t info_item_can_error = 2;	// payload: HAL_CAN_GetError() (u24)
+
+// Bits of the reset flags in GetInfo, read from RCC->CSR at start-up.
+static constexpr uint8_t reset_flag_power_on = 1 << 0;
+static constexpr uint8_t reset_flag_software = 1 << 1;
+static constexpr uint8_t reset_flag_watchdog = 1 << 2;
+static constexpr uint8_t reset_flag_brown_out = 1 << 3;
+static constexpr uint8_t reset_flag_pin = 1 << 4;
 
 // The 8 bytes the host sends, little-endian.
 struct __attribute__((packed)) CommandFrame {
@@ -220,6 +237,8 @@ private:
 	void _handleWriteBuffer(const CommandFrame &frame);
 	void _handleWritePage(const CommandFrame &frame);
 	void _handleWriteCrc(const CommandFrame &frame);
+	void _handleGetInfo(const CommandFrame &frame);
+	void _handleStartApp(const CommandFrame &frame);
 
 	// Look at the stored app: metadata, CRC and vector table. Ok means it can be started.
 	ResponseCode _checkStoredApp() const;
@@ -251,8 +270,9 @@ private:
 	bool _host_seen{false};
 	uint32_t _last_host_frame_ms{0};
 
-	// Set in init(): how long to wait for the host, and whether CAN started.
+	// Set in init(): the reset flags from RCC->CSR, how long to wait for the host, and whether CAN started.
 	// They start at zero so the whole object is in .bss and takes no flash for initial values.
+	uint8_t _reset_flags{0};
 	uint32_t _startup_window_ms{0};
 	bool _can_ready{false};
 };
